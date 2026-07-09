@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.pyc
+.DS_Store
+.venv/
+venv/
+env/
+.env
+.streamlit/secrets.toml
+streamlit.log
+tools/
+data/*.xlsx
+!data/.gitkeep
+sample_data/*.xlsx
+!sample_data/.gitkeep
+output/*
+!output/.gitkeep
