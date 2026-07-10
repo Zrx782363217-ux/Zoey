@@ -10,34 +10,15 @@ import plotly.express as px
 import streamlit as st
 from dotenv import load_dotenv
 
-from db import (
-    create_upload_batch,
-    get_engine,
-    get_database_url,
-    init_db,
-    insert_import_errors,
-    insert_raw_metrics,
-    load_daily_metrics,
-    update_upload_batch,
-    upsert_daily_metrics,
-)
+from db import get_engine, init_db, load_daily_metrics
 
 
-load_dotenv()
+load_dotenv(override=True)
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
-SAMPLE_DATA_DIR = BASE_DIR / "sample_data"
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_CSV = OUTPUT_DIR / "normalized_data.csv"
-
-EXPECTED_FILES = [
-    "碧维抖店7月复盘数据.xlsx",
-    "碧维拼多多运营复盘表7月份.xlsx",
-    "最护抖店7月复盘数据.xlsx",
-    "最护拼多多7月复盘表.xlsx",
-    "最护千川7月复盘数据.xlsx",
-]
 
 STANDARD_COLUMNS = [
     "date",
@@ -104,6 +85,47 @@ def identify_platform(filename: str) -> str:
     return "未知平台"
 
 
+def get_default_year() -> int:
+    env_year = os.getenv("DEFAULT_YEAR", "").strip()
+    if env_year.isdigit() and len(env_year) == 4:
+        return int(env_year)
+    return date.today().year
+
+
+def identify_year(text: str) -> int | None:
+    cleaned = clean_text(text)
+    patterns = [
+        r"(20\d{2})\s*年\s*(?:1[0-2]|0?[1-9])\s*月",
+        r"(20\d{2})[-./](?:1[0-2]|0?[1-9])",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, cleaned)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def identify_month(text: str) -> int | None:
+    cleaned = clean_text(text)
+    patterns = [
+        r"20\d{2}\s*年\s*(1[0-2]|0?[1-9])\s*月份?",
+        r"20\d{2}[-./](1[0-2]|0?[1-9])",
+        r"(1[0-2]|0?[1-9])\s*月份?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, cleaned)
+        if match:
+            month = int(match.group(1))
+            if 1 <= month <= 12:
+                return month
+    return None
+
+
+def identify_period(*parts: str) -> tuple[int, int | None]:
+    text = " ".join(clean_text(part) for part in parts if part)
+    return identify_year(text) or get_default_year(), identify_month(text)
+
+
 def clean_text(value) -> str:
     if pd.isna(value):
         return ""
@@ -135,7 +157,8 @@ def detect_channel(*parts: str) -> str:
     return "整体"
 
 
-def parse_date_cell(value) -> pd.Timestamp | None:
+def parse_date_cell(value, default_year: int | None = None, file_month: int | None = None) -> pd.Timestamp | None:
+    default_year = default_year or get_default_year()
     if pd.isna(value):
         return None
     if isinstance(value, pd.Timestamp):
@@ -150,26 +173,42 @@ def parse_date_cell(value) -> pd.Timestamp | None:
     if not text:
         return None
 
-    text = text.replace("月", ".").replace("日", "")
-    text = text.replace("号", "").replace("/", ".").replace("-", ".")
     text = re.sub(r"\(.+?\)", "", text)
     text = re.sub(r"（.+?）", "", text)
+    normalized = text.replace("月", ".").replace("日", "")
+    normalized = normalized.replace("号", "").replace("/", ".").replace("-", ".")
+
+    full_match = re.fullmatch(r"(20\d{2})\.(\d{1,2})\.(\d{1,2})", normalized)
+    if full_match:
+        try:
+            return pd.Timestamp(year=int(full_match.group(1)), month=int(full_match.group(2)), day=int(full_match.group(3)))
+        except ValueError:
+            return None
+
+    match = re.fullmatch(r"(\d{1,2})\.(\d{1,2})", normalized)
+    if match:
+        month = int(match.group(1))
+        day = int(match.group(2))
+        try:
+            return pd.Timestamp(year=default_year, month=month, day=day)
+        except ValueError:
+            return None
+
+    single_day = re.fullmatch(r"\d{1,2}", normalized)
+    if single_day and file_month:
+        try:
+            return pd.Timestamp(year=default_year, month=file_month, day=int(normalized))
+        except ValueError:
+            return None
+    if single_day:
+        return None
 
     parsed = pd.to_datetime(text, errors="coerce")
     if pd.notna(parsed):
+        parsed = pd.Timestamp(parsed).normalize()
         if parsed.year == 1900:
-            parsed = parsed.replace(year=date.today().year)
-        return pd.Timestamp(parsed).normalize()
-
-    match = re.search(r"(?:(20\d{2})\.)?(\d{1,2})\.(\d{1,2})", text)
-    if match:
-        year = int(match.group(1) or date.today().year)
-        month = int(match.group(2))
-        day = int(match.group(3))
-        try:
-            return pd.Timestamp(year=year, month=month, day=day)
-        except ValueError:
-            return None
+            parsed = parsed.replace(year=default_year)
+        return parsed
 
     return None
 
@@ -211,13 +250,13 @@ def clean_number(value, metric_std: str | None = None) -> float | None:
     return number
 
 
-def find_date_header(df: pd.DataFrame) -> tuple[int | None, dict[int, pd.Timestamp]]:
+def find_date_header(df: pd.DataFrame, default_year: int | None = None, file_month: int | None = None) -> tuple[int | None, dict[int, pd.Timestamp]]:
     best_row = None
     best_dates: dict[int, pd.Timestamp] = {}
     for row_idx in range(min(len(df), 40)):
         dates = {}
         for col_idx, value in enumerate(df.iloc[row_idx].tolist()):
-            parsed = parse_date_cell(value)
+            parsed = parse_date_cell(value, default_year=default_year, file_month=file_month)
             if parsed is not None:
                 dates[col_idx] = parsed
         if len(dates) > len(best_dates):
@@ -229,8 +268,11 @@ def find_date_header(df: pd.DataFrame) -> tuple[int | None, dict[int, pd.Timesta
 
 
 def parse_sheet(df: pd.DataFrame, filename: str, sheet_name: str) -> tuple[list[dict], str | None]:
-    header_row, date_cols = find_date_header(df)
+    default_year, file_month = identify_period(filename, sheet_name)
+    header_row, date_cols = find_date_header(df, default_year=default_year, file_month=file_month)
     if header_row is None:
+        if file_month is None:
+            return [], "未找到横向日期列，且无法从文件名或 sheet 名识别月份"
         return [], "未找到横向日期列"
 
     min_date_col = min(date_cols)
@@ -290,8 +332,7 @@ def parse_excel_sources(sources: list[tuple[str, object]]) -> tuple[pd.DataFrame
 
     all_rows = []
     warnings = []
-    filenames = [name for name, _ in sources]
-    missing = [name for name in EXPECTED_FILES if name not in filenames]
+    missing: list[str] = []
 
     for filename, file_obj in sources:
         if hasattr(file_obj, "seek"):
@@ -333,79 +374,15 @@ def load_uploaded_data(uploaded_files) -> tuple[pd.DataFrame, pd.DataFrame, list
     if not uploaded_files:
         raw_df, op_df = empty_dataframes()
         export_normalized_data(raw_df)
-        return raw_df, op_df, [], EXPECTED_FILES.copy()
+        return raw_df, op_df, [], []
     sources = [(uploaded_file.name, uploaded_file) for uploaded_file in uploaded_files]
     return parse_excel_sources(sources)
-
-
-@st.cache_data(show_spinner=False)
-def load_sample_data() -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
-    SAMPLE_DATA_DIR.mkdir(exist_ok=True)
-    sources = [(path.name, path) for path in sorted(SAMPLE_DATA_DIR.glob("*.xlsx"))]
-    if not sources:
-        raw_df, op_df = empty_dataframes()
-        export_normalized_data(raw_df)
-        return raw_df, op_df, ["sample_data 文件夹中暂无示例 Excel"], EXPECTED_FILES.copy()
-    return parse_excel_sources(sources)
-
-
-def save_upload_to_database(
-    raw_df: pd.DataFrame,
-    op_df: pd.DataFrame,
-    warnings: list[str],
-    uploaded_files,
-    uploader_name: str | None,
-) -> tuple[bool, dict[str, int | str]]:
-    engine = get_engine()
-    if engine is None:
-        return False, {"message": "请配置数据库连接。本次上传只完成临时解析，未写入数据库。", "inserted": 0, "updated": 0, "failed": 1}
-
-    try:
-        init_db(engine)
-        file_names = [file.name for file in uploaded_files]
-        initial_status = "partial" if warnings else "success"
-        batch_id = create_upload_batch(
-            file_names=file_names,
-            uploader_name=uploader_name,
-            status=initial_status,
-            message="上传已接收，开始解析入库。",
-            engine=engine,
-        )
-        raw_count = insert_raw_metrics(raw_df, batch_id, engine=engine)
-        upsert_counts = upsert_daily_metrics(op_df, batch_id, raw_df=raw_df, engine=engine)
-        error_count = insert_import_errors(warnings, batch_id, engine=engine)
-        status = "partial" if warnings else "success"
-        message = (
-            f"入库完成：新增 {upsert_counts['inserted']} 条，更新 {upsert_counts['updated']} 条，"
-            f"原始指标 {raw_count} 条，失败/提示 {error_count} 条。"
-        )
-        if batch_id is not None:
-            update_upload_batch(batch_id, status=status, message=message, engine=engine)
-        return True, {
-            "message": message,
-            "inserted": upsert_counts["inserted"],
-            "updated": upsert_counts["updated"],
-            "failed": error_count,
-        }
-    except Exception as exc:
-        try:
-            batch_id = create_upload_batch(
-                file_names=[file.name for file in uploaded_files],
-                uploader_name=uploader_name,
-                status="failed",
-                message=str(exc),
-                engine=engine,
-            )
-            insert_import_errors([str(exc)], batch_id, engine=engine)
-        except Exception:
-            pass
-        return False, {"message": f"数据库写入失败：{exc}", "inserted": 0, "updated": 0, "failed": 1}
 
 
 def load_history_from_database() -> tuple[pd.DataFrame, str]:
     engine = get_engine()
     if engine is None:
-        return pd.DataFrame(columns=STANDARD_COLUMNS), "未配置 DATABASE_URL，当前只能查看本次上传或示例数据。"
+        return pd.DataFrame(columns=STANDARD_COLUMNS), "未配置 DATABASE_URL，请管理员配置数据库连接。"
     try:
         init_db(engine)
         history_df = load_daily_metrics(engine=engine)
@@ -462,60 +439,175 @@ def build_operating_table(raw_df: pd.DataFrame) -> pd.DataFrame:
     return op_df
 
 
-def fmt_number(value, digits: int = 0) -> str:
-    if pd.isna(value):
+def inject_custom_css():
+    st.markdown(
+        """
+        <style>
+        .block-container { padding-top: 1.6rem; padding-bottom: 2rem; }
+        .main-title { font-size: 30px; font-weight: 700; color: #111827; margin-bottom: 4px; }
+        .subtle-note { color: #6b7280; font-size: 14px; line-height: 1.6; margin-bottom: 14px; }
+        .metric-card {
+            background: #ffffff;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 16px 18px;
+            box-shadow: 0 4px 14px rgba(15, 23, 42, 0.06);
+            min-height: 112px;
+            margin-bottom: 12px;
+        }
+        .metric-label { color: #6b7280; font-size: 13px; margin-bottom: 8px; }
+        .metric-value { color: #111827; font-size: 27px; font-weight: 750; line-height: 1.25; }
+        .metric-help { color: #9ca3af; font-size: 12px; margin-top: 6px; }
+        .delta-pos { color: #059669; font-size: 13px; font-weight: 650; margin-top: 8px; }
+        .delta-neg { color: #dc2626; font-size: 13px; font-weight: 650; margin-top: 8px; }
+        .delta-flat { color: #6b7280; font-size: 13px; font-weight: 650; margin-top: 8px; }
+        .section-title { color: #111827; font-size: 19px; font-weight: 700; margin: 18px 0 10px 0; }
+        .info-box {
+            background: #f8fafc;
+            border: 1px solid #e5e7eb;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 14px;
+            color: #374151;
+        }
+        .alert-card {
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 12px;
+            border: 1px solid #e5e7eb;
+        }
+        .alert-high { background: #fef2f2; border-color: #fecaca; }
+        .alert-mid { background: #fff7ed; border-color: #fed7aa; }
+        .alert-low { background: #eff6ff; border-color: #bfdbfe; }
+        .tag { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 12px; font-weight: 700; margin-left: 8px; }
+        .tag-high { background: #dc2626; color: #fff; }
+        .tag-mid { background: #f97316; color: #fff; }
+        .tag-low { background: #2563eb; color: #fff; }
+        div[data-testid="stPlotlyChart"] { background: #ffffff; border: 1px solid #e5e7eb; border-radius: 12px; padding: 10px; box-shadow: 0 4px 14px rgba(15, 23, 42, 0.04); }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def safe_float(value) -> float | None:
+    if value is None or pd.isna(value):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def format_number(value, digits: int = 0) -> str:
+    number = safe_float(value)
+    if number is None:
         return "暂无"
-    return f"{float(value):,.{digits}f}"
+    return f"{number:,.{digits}f}"
 
 
-def fmt_ratio(value) -> str:
-    if pd.isna(value):
+def format_percent(value) -> str:
+    number = safe_float(value)
+    if number is None:
         return "暂无"
-    return f"{float(value) * 100:.1f}%"
+    return f"{number * 100:.1f}%"
 
 
-def fmt_roi(value) -> str:
-    if pd.isna(value):
+def format_roi(value) -> str:
+    number = safe_float(value)
+    if number is None:
         return "暂无"
-    return f"{float(value):.2f}"
+    return f"{number:.2f}"
 
 
-def delta_text(current, previous, as_ratio: bool = False) -> str:
-    if pd.isna(current) or pd.isna(previous) or previous == 0:
-        return "暂无对比"
-    change = (current - previous) / abs(previous)
-    return f"{change * 100:+.1f}%"
+def format_delta(current, previous) -> tuple[str, str]:
+    current_num = safe_float(current)
+    previous_num = safe_float(previous)
+    if current_num is None or previous_num is None or previous_num == 0:
+        return "暂无对比", "flat"
+    change = (current_num - previous_num) / abs(previous_num)
+    if change > 0:
+        return f"+{change * 100:.1f}%", "pos"
+    if change < 0:
+        return f"{change * 100:.1f}%", "neg"
+    return "0.0%", "flat"
 
 
-def aggregate_daily(df: pd.DataFrame) -> pd.DataFrame:
+def ratio(numerator, denominator) -> float | None:
+    n = safe_float(numerator)
+    d = safe_float(denominator)
+    if n is None or d is None or d == 0:
+        return None
+    return n / d
+
+
+def aggregate_metrics(df: pd.DataFrame) -> dict:
+    result = {metric: None for metric in STANDARD_COLUMNS[4:]}
     if df.empty:
-        return pd.DataFrame(columns=STANDARD_COLUMNS)
-    rows = []
-    for keys, group in df.groupby(["date", "brand", "platform", "channel"], dropna=False):
-        row = dict(zip(["date", "brand", "platform", "channel"], keys))
-        for metric in MONEY_OR_COUNT_METRICS:
-            row[metric] = group[metric].sum(min_count=1)
-        for metric in RATE_METRICS | ROI_METRICS:
-            row[metric] = group[metric].mean()
-        if pd.notna(row.get("gmv")) and pd.notna(row.get("ad_spend")) and row.get("ad_spend") not in [0, None]:
-            row["roi"] = row["gmv"] / row["ad_spend"]
-        if pd.notna(row.get("net_gmv")) and pd.notna(row.get("ad_spend")) and row.get("ad_spend") not in [0, None]:
-            row["net_roi"] = row["net_gmv"] / row["ad_spend"]
-        rows.append(row)
-    return pd.DataFrame(rows)
+        return result
+    working = df.copy()
+    for col in STANDARD_COLUMNS[4:]:
+        if col in working.columns:
+            working[col] = pd.to_numeric(working[col], errors="coerce")
+
+    for metric in MONEY_OR_COUNT_METRICS:
+        if metric in working.columns:
+            value = working[metric].sum(min_count=1)
+            result[metric] = None if pd.isna(value) else float(value)
+
+    result["roi"] = ratio(result.get("gmv"), result.get("ad_spend"))
+    result["net_roi"] = ratio(result.get("net_gmv"), result.get("ad_spend"))
+    result["refund_rate"] = ratio(result.get("refund_amount"), result.get("gmv"))
+    if result["refund_rate"] is None and "refund_rate" in working.columns:
+        mean_refund = working["refund_rate"].dropna().mean()
+        result["refund_rate"] = None if pd.isna(mean_refund) else float(mean_refund)
+    return result
 
 
-def latest_and_previous(df: pd.DataFrame) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
-    if df.empty or df["date"].dropna().empty:
-        return None, None
-    dates = sorted(df["date"].dropna().unique())
-    latest = dates[-1]
-    previous = dates[-2] if len(dates) >= 2 else None
-    return latest, previous
+def get_available_dates(df: pd.DataFrame) -> list[pd.Timestamp]:
+    if df.empty or "date" not in df.columns:
+        return []
+    dates = pd.to_datetime(df["date"], errors="coerce").dropna().dt.normalize().drop_duplicates().sort_values()
+    return list(dates)
 
 
-def make_metric_card(label: str, value: str, help_text: str | None = None):
-    st.metric(label, value, help=help_text)
+def get_previous_available_date(df: pd.DataFrame, selected_date) -> pd.Timestamp | None:
+    dates = [d for d in get_available_dates(df) if d < pd.Timestamp(selected_date).normalize()]
+    return dates[-1] if dates else None
+
+
+def filter_by_selected_date(df: pd.DataFrame, selected_date, mode: str) -> pd.DataFrame:
+    if df.empty:
+        return df.copy()
+    selected = pd.Timestamp(selected_date).normalize()
+    working = df.copy()
+    working["date"] = pd.to_datetime(working["date"], errors="coerce").dt.normalize()
+    if mode == "本月累计":
+        month_start = selected.replace(day=1)
+        return working[(working["date"] >= month_start) & (working["date"] <= selected)]
+    return working[working["date"] == selected]
+
+
+def render_metric_card(title: str, value: str, delta: str | None = None, delta_state: str = "flat", help_text: str | None = None):
+    delta_html = ""
+    if delta is not None:
+        delta_html = f'<div class="delta-{delta_state}">{delta}</div>'
+    help_html = f'<div class="metric-help">{help_text}</div>' if help_text else ""
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-label">{title}</div>
+            <div class="metric-value">{value}</div>
+            {delta_html}
+            {help_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_info_box(text: str):
+    st.markdown(f'<div class="info-box">{text}</div>', unsafe_allow_html=True)
 
 
 def get_app_password() -> str:
@@ -530,7 +622,7 @@ def get_app_password() -> str:
 def require_password() -> bool:
     password = get_app_password()
     if not password:
-        st.warning("安全提醒：当前未设置 APP_PASSWORD，页面默认允许访问。部署前请在 Streamlit Secrets 或 Render 环境变量中设置访问密码。")
+        st.warning("安全提醒：当前未设置 APP_PASSWORD，页面默认允许访问。部署前请在 Streamlit Secrets 中设置访问密码。")
         return True
 
     if st.session_state.get("authenticated"):
@@ -547,474 +639,294 @@ def require_password() -> bool:
     return False
 
 
-def render_line_chart(df: pd.DataFrame, y_col: str, title: str, formatter: str | None = None):
-    chart_df = df.dropna(subset=[y_col]).copy()
+def render_chart(df: pd.DataFrame, y_col: str, title: str, formatter: str | None = None):
+    chart_df = df.dropna(subset=[y_col]).copy() if y_col in df.columns else pd.DataFrame()
     if chart_df.empty:
-        st.info(f"{title}：暂无数据")
+        render_info_box("当前筛选条件下暂无数据")
         return
-    chart_df["分组"] = chart_df["brand"] + "-" + chart_df["platform"] + "-" + chart_df["channel"]
+    chart_df["分组"] = chart_df["brand"].astype(str) + "-" + chart_df["platform"].astype(str) + "-" + chart_df["channel"].astype(str)
     fig = px.line(chart_df, x="date", y=y_col, color="分组", markers=True, title=title)
-    fig.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10), legend_title_text="")
+    fig.update_layout(height=350, margin=dict(l=10, r=10, t=48, b=10), legend_title_text="", hovermode="x unified")
+    fig.update_traces(line=dict(width=2.4), marker=dict(size=6))
     if formatter == "percent":
         fig.update_yaxes(tickformat=".1%")
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_bar_chart(df: pd.DataFrame, y_col: str, title: str, formatter: str | None = None):
-    chart_df = df.dropna(subset=[y_col]).copy()
+def render_bar(df: pd.DataFrame, y_col: str, title: str, formatter: str | None = None):
+    chart_df = df.dropna(subset=[y_col]).copy() if y_col in df.columns else pd.DataFrame()
     if chart_df.empty:
-        st.info(f"{title}：暂无数据")
+        render_info_box("当前筛选条件下暂无数据")
         return
     fig = px.bar(chart_df, x="channel", y=y_col, color="brand", barmode="group", title=title)
-    fig.update_layout(height=340, margin=dict(l=10, r=10, t=50, b=10), legend_title_text="")
+    fig.update_layout(height=340, margin=dict(l=10, r=10, t=48, b=10), legend_title_text="")
     if formatter == "percent":
         fig.update_yaxes(tickformat=".1%")
     st.plotly_chart(fig, use_container_width=True)
 
 
-def filter_df(df: pd.DataFrame, brand: str, platform: str, channel: str, date_range) -> pd.DataFrame:
-    filtered = df.copy()
-    if date_range and len(date_range) == 2:
-        start, end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
-        filtered = filtered[(filtered["date"] >= start) & (filtered["date"] <= end)]
-    if brand != "全部":
-        filtered = filtered[filtered["brand"] == brand]
-    if platform != "全部":
-        filtered = filtered[filtered["platform"] == platform]
-    if channel != "全部":
-        filtered = filtered[filtered["channel"] == channel]
-    return filtered
+def render_date_controls(op_df: pd.DataFrame) -> tuple[pd.Timestamp | None, str, pd.Timestamp | None]:
+    dates = get_available_dates(op_df)
+    if not dates:
+        return None, "本日数据", None
+    latest = dates[-1]
+    years = sorted({d.year for d in dates})
+    default_year_index = years.index(latest.year)
+
+    cols = st.columns([1, 1, 1.2, 1.3, 1.7, 1.7])
+    year = cols[0].selectbox("年份", years, index=default_year_index)
+    months = sorted({d.month for d in dates if d.year == year})
+    default_month = latest.month if latest.year == year and latest.month in months else months[-1]
+    month = cols[1].selectbox("月份", months, index=months.index(default_month), format_func=lambda m: f"{m}月")
+    day_dates = [d for d in dates if d.year == year and d.month == month]
+    default_day = latest if latest in day_dates else day_dates[-1]
+    selected_date = cols[2].selectbox("日期", day_dates, index=day_dates.index(default_day), format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d"))
+    mode = cols[3].radio("查看口径", ["本日数据", "本月累计"], horizontal=True)
+    previous_date = get_previous_available_date(op_df, selected_date)
+    cols[4].markdown(f"**当前查看日期**  \n{pd.Timestamp(selected_date).date()}")
+    compare_text = "本月累计暂无对比" if mode == "本月累计" else (str(pd.Timestamp(previous_date).date()) if previous_date is not None else "暂无对比")
+    cols[5].markdown(f"**对比日期**  \n{compare_text}")
+    return pd.Timestamp(selected_date), mode, previous_date
 
 
-def aggregate_for_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
-    if df.empty or period == "每日":
-        return df.copy()
-
-    working = df.copy()
-    working["date"] = pd.to_datetime(working["date"], errors="coerce")
-    working = working.dropna(subset=["date"])
-    if period == "每周":
-        working["period_date"] = working["date"].dt.to_period("W-SUN").dt.start_time
-    elif period == "每月":
-        working["period_date"] = working["date"].dt.to_period("M").dt.start_time
-    else:
-        return working
-
-    rows = []
-    group_cols = ["period_date", "brand", "platform", "channel"]
-    for keys, group in working.groupby(group_cols, dropna=False):
-        row = {
-            "date": keys[0],
-            "brand": keys[1],
-            "platform": keys[2],
-            "channel": keys[3],
-        }
-        for metric in MONEY_OR_COUNT_METRICS:
-            row[metric] = group[metric].sum(min_count=1)
-        for metric in RATE_METRICS | ROI_METRICS:
-            row[metric] = group[metric].mean()
-        if pd.notna(row.get("gmv")) and pd.notna(row.get("ad_spend")) and row.get("ad_spend") not in [0, None]:
-            row["roi"] = row["gmv"] / row["ad_spend"]
-        if pd.notna(row.get("net_gmv")) and pd.notna(row.get("ad_spend")) and row.get("ad_spend") not in [0, None]:
-            row["net_roi"] = row["net_gmv"] / row["ad_spend"]
-        rows.append(row)
-    return pd.DataFrame(rows)
+def main_scope(df: pd.DataFrame) -> pd.DataFrame:
+    return df[df["platform"].isin(["抖店", "拼多多"])].copy() if not df.empty else df.copy()
 
 
-def brand_reason(brand: str, alert_type: str) -> str:
-    if brand == "最护":
-        return "重点检查洗脸巾在抖店直播、商品卡、短视频和千川投放中的流量承接、转化链路和退款风险。"
-    if brand == "碧维":
-        return "重点检查抹布在拼多多基本盘、抖店起量、低价转化、投放效率和退款风险上的变化。"
-    return "检查流量、转化、投放效率和售后风险。"
-
-
-def generate_alerts(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-    alerts = []
-    sorted_df = df.sort_values(["brand", "platform", "channel", "date"])
-    for (brand, platform, channel), group in sorted_df.groupby(["brand", "platform", "channel"]):
-        group = group.sort_values("date").reset_index(drop=True)
-        for idx, row in group.iterrows():
-            prev = group.iloc[idx - 1] if idx > 0 else None
-            context = {
-                "brand": brand,
-                "platform": platform,
-                "channel": channel,
-                "date": row["date"].date().isoformat() if pd.notna(row["date"]) else "",
-            }
-
-            gmv = row.get("gmv")
-            roi = row.get("roi")
-            ad_spend = row.get("ad_spend")
-            refund_rate = row.get("refund_rate")
-            conversion_rate = row.get("conversion_rate")
-
-            if prev is not None:
-                prev_gmv = prev.get("gmv")
-                prev_roi = prev.get("roi")
-                prev_refund = prev.get("refund_rate")
-                prev_conversion = prev.get("conversion_rate")
-
-                if pd.notna(gmv) and pd.notna(prev_gmv) and prev_gmv > 0 and (gmv - prev_gmv) / prev_gmv < -0.1:
-                    alerts.append(
-                        {
-                            **context,
-                            "标题": "销售下滑",
-                            "严重程度": "中",
-                            "数据依据": f"GMV 较前一日下降 {abs((gmv - prev_gmv) / prev_gmv) * 100:.1f}%",
-                            "可能原因": brand_reason(brand, "销售下滑"),
-                            "建议动作": "检查流量、直播节奏、商品承接、价格活动等因素。",
-                        }
-                    )
-                if pd.notna(roi) and pd.notna(prev_roi) and prev_roi > 0 and (roi - prev_roi) / prev_roi < -0.1:
-                    alerts.append(
-                        {
-                            **context,
-                            "标题": "投放效率下降",
-                            "严重程度": "中",
-                            "数据依据": f"ROI 较前一日下降 {abs((roi - prev_roi) / prev_roi) * 100:.1f}%",
-                            "可能原因": brand_reason(brand, "投放效率下降"),
-                            "建议动作": "检查投放计划、素材、人群、出价和成交转化。",
-                        }
-                    )
-                if (
-                    pd.notna(conversion_rate)
-                    and pd.notna(prev_conversion)
-                    and prev_conversion > 0
-                    and (conversion_rate - prev_conversion) / prev_conversion < -0.1
-                ):
-                    alerts.append(
-                        {
-                            **context,
-                            "标题": "转化承接问题",
-                            "严重程度": "中",
-                            "数据依据": f"成交转化率较前一日下降 {abs((conversion_rate - prev_conversion) / prev_conversion) * 100:.1f}%",
-                            "可能原因": brand_reason(brand, "转化承接问题"),
-                            "建议动作": "检查商品价格、主图、详情页、评价、客服和流量质量。",
-                        }
-                    )
-                if (
-                    pd.notna(gmv)
-                    and pd.notna(prev_gmv)
-                    and gmv > prev_gmv
-                    and pd.notna(refund_rate)
-                    and pd.notna(prev_refund)
-                    and refund_rate > prev_refund
-                ):
-                    alerts.append(
-                        {
-                            **context,
-                            "标题": "增长质量风险",
-                            "严重程度": "中",
-                            "数据依据": f"GMV 增长，同时退款率从 {prev_refund * 100:.1f}% 升至 {refund_rate * 100:.1f}%",
-                            "可能原因": brand_reason(brand, "增长质量风险"),
-                            "建议动作": "检查新增流量质量，避免 GMV 增长但售后风险扩大。",
-                        }
-                    )
-
-            if pd.notna(ad_spend) and ad_spend > 0 and (pd.isna(gmv) or gmv == 0):
-                alerts.append(
-                    {
-                        **context,
-                        "标题": "无效消耗",
-                        "严重程度": "高",
-                        "数据依据": f"投放消耗 {ad_spend:.0f}，GMV 为 0 或为空",
-                        "可能原因": brand_reason(brand, "无效消耗"),
-                        "建议动作": "暂停或降低低效投放，检查素材、落地页、商品价格和转化承接。",
-                    }
-                )
-            if pd.notna(refund_rate) and refund_rate > 0.1:
-                alerts.append(
-                    {
-                        **context,
-                        "标题": "退款风险",
-                        "严重程度": "高",
-                        "数据依据": f"退款率 {refund_rate * 100:.1f}%，超过 10%",
-                        "可能原因": brand_reason(brand, "退款风险"),
-                        "建议动作": "检查商品预期差、详情页表达、客服承接、质量问题和售后原因。",
-                    }
-                )
-            if pd.notna(roi) and roi > 5 and pd.notna(gmv) and gmv < 1000:
-                alerts.append(
-                    {
-                        **context,
-                        "标题": "高效率低规模",
-                        "严重程度": "低",
-                        "数据依据": f"ROI {roi:.2f}，但 GMV 仅 {gmv:.0f}",
-                        "可能原因": brand_reason(brand, "高效率低规模"),
-                        "建议动作": "可以小幅测试放量，但要观察退款率和转化稳定性。",
-                    }
-                )
-    return pd.DataFrame(alerts)
+def render_business_card(brand: str, platform: str, df: pd.DataFrame, previous_df: pd.DataFrame | None, mode: str):
+    card_df = df[(df["brand"] == brand) & (df["platform"] == platform)] if not df.empty else pd.DataFrame()
+    with st.container(border=True):
+        st.markdown(f"#### {brand} - {platform}")
+        if card_df.empty:
+            st.info("暂无数据")
+            return
+        current = aggregate_metrics(card_df)
+        previous = aggregate_metrics(previous_df[(previous_df["brand"] == brand) & (previous_df["platform"] == platform)]) if previous_df is not None and not previous_df.empty else {}
+        gmv_delta, gmv_state = ("本月累计暂无对比", "flat") if mode == "本月累计" else format_delta(current.get("gmv"), previous.get("gmv"))
+        roi_delta, roi_state = ("本月累计暂无对比", "flat") if mode == "本月累计" else format_delta(current.get("roi"), previous.get("roi"))
+        cols = st.columns(3)
+        with cols[0]:
+            render_metric_card("GMV", format_number(current.get("gmv")), gmv_delta, gmv_state)
+        with cols[1]:
+            render_metric_card("单量", format_number(current.get("orders")))
+        with cols[2]:
+            render_metric_card("投放消耗", format_number(current.get("ad_spend")))
+        cols = st.columns(3)
+        with cols[0]:
+            render_metric_card("ROI", format_roi(current.get("roi")), roi_delta, roi_state)
+        with cols[1]:
+            render_metric_card("净 ROI", format_roi(current.get("net_roi")))
+        with cols[2]:
+            render_metric_card("退款率", format_percent(current.get("refund_rate")))
 
 
 def render_boss_home(op_df: pd.DataFrame):
-    st.subheader("老板首页")
-    main_df = op_df[op_df["platform"].isin(["抖店", "拼多多"])].copy()
-    latest, previous = latest_and_previous(main_df)
-    if latest is None:
-        st.info("暂无可展示的经营数据。请先上传 Excel 复盘表，或勾选使用示例数据。")
+    st.subheader("BOSS首页")
+    if op_df.empty:
+        render_info_box("暂无历史数据，请管理员在后台导入数据。")
         return
 
-    st.caption(f"最新有数据日期：{pd.Timestamp(latest).date().isoformat()}。总 GMV 默认不包含千川，避免与抖店重复。")
+    selected_date, mode, previous_date = render_date_controls(op_df)
+    if selected_date is None:
+        render_info_box("暂无历史数据，请管理员在后台导入数据。")
+        return
 
-    latest_df = main_df[main_df["date"] == latest]
-    prev_df = main_df[main_df["date"] == previous] if previous is not None else pd.DataFrame()
+    current_df = filter_by_selected_date(op_df, selected_date, mode)
+    if current_df.empty:
+        st.warning("当前日期暂无数据，请选择其他日期。")
+        return
+    previous_df = filter_by_selected_date(op_df, previous_date, "本日数据") if previous_date is not None and mode == "本日数据" else pd.DataFrame()
 
-    total_gmv = latest_df["gmv"].sum(min_count=1)
-    total_orders = latest_df["orders"].sum(min_count=1)
-    total_spend = latest_df["ad_spend"].sum(min_count=1)
-    total_net_gmv = latest_df["net_gmv"].sum(min_count=1)
-    total_roi = total_gmv / total_spend if pd.notna(total_gmv) and pd.notna(total_spend) and total_spend else latest_df["roi"].mean()
-    total_net_roi = total_net_gmv / total_spend if pd.notna(total_net_gmv) and pd.notna(total_spend) and total_spend else latest_df["net_roi"].mean()
-    total_refund_rate = latest_df["refund_rate"].mean()
+    current_main = main_scope(current_df)
+    previous_main = main_scope(previous_df)
+    current = aggregate_metrics(current_main)
+    previous = aggregate_metrics(previous_main)
+    gmv_delta, gmv_state = ("本月累计暂无对比", "flat") if mode == "本月累计" else format_delta(current.get("gmv"), previous.get("gmv"))
+    roi_delta, roi_state = ("本月累计暂无对比", "flat") if mode == "本月累计" else format_delta(current.get("roi"), previous.get("roi"))
 
-    prev_gmv = prev_df["gmv"].sum(min_count=1) if not prev_df.empty else pd.NA
-    prev_spend = prev_df["ad_spend"].sum(min_count=1) if not prev_df.empty else pd.NA
-    prev_roi = prev_gmv / prev_spend if pd.notna(prev_gmv) and pd.notna(prev_spend) and prev_spend else pd.NA
-
+    st.markdown('<div class="section-title">核心指标</div>', unsafe_allow_html=True)
     cols = st.columns(4)
-    cols[0].metric("总 GMV", fmt_number(total_gmv), delta_text(total_gmv, prev_gmv))
-    cols[1].metric("总单量", fmt_number(total_orders), None)
-    cols[2].metric("总投放消耗", fmt_number(total_spend), None)
-    cols[3].metric("整体 ROI", fmt_roi(total_roi), delta_text(total_roi, prev_roi))
-
+    with cols[0]:
+        render_metric_card("总 GMV", format_number(current.get("gmv")), help_text="不含千川，避免重复计算")
+    with cols[1]:
+        render_metric_card("总单量", format_number(current.get("orders")))
+    with cols[2]:
+        render_metric_card("总投放消耗", format_number(current.get("ad_spend")))
+    with cols[3]:
+        render_metric_card("整体 ROI", format_roi(current.get("roi")))
     cols = st.columns(4)
-    cols[0].metric("净 ROI", fmt_roi(total_net_roi))
-    cols[1].metric("退款率", fmt_ratio(total_refund_rate))
-    cols[2].metric("较前一日 GMV 变化", delta_text(total_gmv, prev_gmv))
-    cols[3].metric("较前一日 ROI 变化", delta_text(total_roi, prev_roi))
+    with cols[0]:
+        render_metric_card("净 ROI", format_roi(current.get("net_roi")))
+    with cols[1]:
+        render_metric_card("退款率", format_percent(current.get("refund_rate")))
+    with cols[2]:
+        render_metric_card("较上一有数据日 GMV 变化", gmv_delta, delta_state=gmv_state)
+    with cols[3]:
+        render_metric_card("较上一有数据日 ROI 变化", roi_delta, delta_state=roi_state)
 
-    st.markdown("### 四个经营卡片")
-    for brand, platform in [("最护", "抖店"), ("最护", "拼多多"), ("碧维", "抖店"), ("碧维", "拼多多")]:
-        card_df = main_df[(main_df["brand"] == brand) & (main_df["platform"] == platform)]
-        latest_card = card_df[card_df["date"] == latest]
-        prev_card = card_df[card_df["date"] == previous] if previous is not None else pd.DataFrame()
-        with st.container(border=True):
-            st.markdown(f"#### {brand} - {platform}")
-            if latest_card.empty:
-                st.info("暂无数据")
-                continue
-            gmv = latest_card["gmv"].sum(min_count=1)
-            orders = latest_card["orders"].sum(min_count=1)
-            spend = latest_card["ad_spend"].sum(min_count=1)
-            net_gmv = latest_card["net_gmv"].sum(min_count=1)
-            roi = gmv / spend if pd.notna(gmv) and pd.notna(spend) and spend else latest_card["roi"].mean()
-            net_roi = net_gmv / spend if pd.notna(net_gmv) and pd.notna(spend) and spend else latest_card["net_roi"].mean()
-            refund_rate = latest_card["refund_rate"].mean()
-            old_gmv = prev_card["gmv"].sum(min_count=1) if not prev_card.empty else pd.NA
-            old_spend = prev_card["ad_spend"].sum(min_count=1) if not prev_card.empty else pd.NA
-            old_roi = old_gmv / old_spend if pd.notna(old_gmv) and pd.notna(old_spend) and old_spend else pd.NA
-            cols = st.columns(4)
-            cols[0].metric("GMV", fmt_number(gmv), delta_text(gmv, old_gmv))
-            cols[1].metric("单量", fmt_number(orders))
-            cols[2].metric("投放消耗", fmt_number(spend))
-            cols[3].metric("ROI", fmt_roi(roi), delta_text(roi, old_roi))
-            cols = st.columns(3)
-            cols[0].metric("净 ROI", fmt_roi(net_roi))
-            cols[1].metric("退款率", fmt_ratio(refund_rate))
-            cols[2].metric("较前一日 GMV / ROI", f"{delta_text(gmv, old_gmv)} / {delta_text(roi, old_roi)}")
+    st.markdown('<div class="section-title">四个经营卡片</div>', unsafe_allow_html=True)
+    rows = [[("最护", "抖店"), ("最护", "拼多多")], [("碧维", "抖店"), ("碧维", "拼多多")]]
+    for row in rows:
+        cols = st.columns(2)
+        for col, (brand, platform) in zip(cols, row):
+            with col:
+                render_business_card(brand, platform, current_main, previous_main, mode)
+
+    st.markdown('<div class="section-title">当前日期核心提醒</div>', unsafe_allow_html=True)
+    alert_df = generate_alerts(current_df if mode == "本日数据" else current_df[current_df["date"] == selected_date])
+    if alert_df.empty:
+        render_info_box("当前日期暂无明显异常")
+    else:
+        render_alert_cards(alert_df.head(3), compact=True)
 
 
 def render_trends(op_df: pd.DataFrame):
-    st.subheader("趋势分析")
+    st.subheader("历史趋势")
     if op_df.empty:
-        st.info("暂无数据")
+        render_info_box("暂无历史数据，请管理员在后台导入数据。")
         return
     min_date = op_df["date"].min().date()
     max_date = op_df["date"].max().date()
     cols = st.columns(5)
     date_range = cols[0].date_input("日期范围", value=(min_date, max_date), min_value=min_date, max_value=max_date)
-    brand = cols[1].selectbox("品牌", ["全部"] + sorted(op_df["brand"].dropna().unique().tolist()))
-    platform = cols[2].selectbox("平台", ["全部"] + sorted(op_df["platform"].dropna().unique().tolist()))
-    channel_options = ["全部", "整体", "商品卡", "直播", "短视频", "千川"]
-    channel = cols[3].selectbox("渠道", channel_options)
+    brand = cols[1].selectbox("品牌", ["全部", "最护", "碧维"])
+    platform = cols[2].selectbox("平台", ["全部", "抖店", "拼多多", "千川"])
+    channel = cols[3].selectbox("渠道", ["全部", "整体", "商品卡", "直播", "短视频", "千川"])
     period = cols[4].selectbox("趋势粒度", ["每日", "每周", "每月"])
 
     filtered = filter_df(op_df, brand, platform, channel, date_range)
+    if filtered.empty:
+        render_info_box("当前筛选条件下暂无数据")
+        return
     trend_df = aggregate_for_period(filtered, period)
-    render_line_chart(trend_df, "gmv", f"GMV {period}趋势图")
-    render_line_chart(trend_df, "orders", f"单量 {period}趋势图")
-    render_line_chart(trend_df, "ad_spend", f"投放消耗 {period}趋势图")
-    render_line_chart(trend_df, "roi", f"ROI {period}趋势图")
-    render_line_chart(trend_df, "net_roi", f"净 ROI {period}趋势图")
-    render_line_chart(trend_df, "refund_rate", f"退款率 {period}趋势图", formatter="percent")
+    render_chart(trend_df, "gmv", f"GMV {period}趋势")
+    render_chart(trend_df, "orders", f"单量 {period}趋势")
+    render_chart(trend_df, "ad_spend", f"投放消耗 {period}趋势")
+    render_chart(trend_df, "roi", f"ROI {period}趋势")
+    render_chart(trend_df, "refund_rate", f"退款率 {period}趋势", formatter="percent")
 
 
 def render_channel_analysis(op_df: pd.DataFrame):
     st.subheader("渠道分析")
     if op_df.empty:
-        st.info("暂无数据")
+        render_info_box("暂无历史数据，请管理员在后台导入数据。")
+        return
+    min_date = op_df["date"].min().date()
+    max_date = op_df["date"].max().date()
+    date_range = st.date_input("日期范围", value=(min_date, max_date), min_value=min_date, max_value=max_date, key="channel_date_range")
+    filtered = filter_df(op_df, "全部", "全部", "全部", date_range)
+    if filtered.empty:
+        render_info_box("当前筛选条件下暂无数据")
         return
 
     douyin_channels = ["整体", "商品卡", "直播", "短视频", "店铺号商品卡", "洗脸巾直播"]
-    douyin_df = op_df[(op_df["platform"] == "抖店") & (op_df["channel"].isin(douyin_channels))].copy()
+    douyin_df = filtered[(filtered["platform"] == "抖店") & (filtered["channel"].isin(douyin_channels))].copy()
     if douyin_df.empty:
-        st.info("暂无抖店渠道数据")
+        render_info_box("暂无抖店渠道数据")
     else:
-        latest, _ = latest_and_previous(douyin_df)
-        latest_douyin = douyin_df[douyin_df["date"] == latest]
-        st.caption(f"抖店渠道最新日期：{pd.Timestamp(latest).date().isoformat()}")
-        render_bar_chart(latest_douyin, "gmv", "各渠道 GMV 对比")
-        render_bar_chart(latest_douyin, "orders", "各渠道单量对比")
-        render_bar_chart(latest_douyin, "ad_spend", "各渠道投放消耗对比")
-        render_bar_chart(latest_douyin, "roi", "各渠道 ROI 对比")
-        render_bar_chart(latest_douyin, "refund_rate", "各渠道退款率对比", formatter="percent")
+        channel_df = aggregate_for_period(douyin_df, "每日")
+        channel_summary = []
+        for keys, group in channel_df.groupby(["brand", "channel"], dropna=False):
+            row = aggregate_metrics(group)
+            row.update({"brand": keys[0], "channel": keys[1]})
+            channel_summary.append(row)
+        summary_df = pd.DataFrame(channel_summary)
+        render_bar(summary_df, "gmv", "各渠道 GMV")
+        render_bar(summary_df, "orders", "各渠道单量")
+        render_bar(summary_df, "ad_spend", "各渠道投放消耗")
+        render_bar(summary_df, "roi", "各渠道 ROI")
+        render_bar(summary_df, "refund_rate", "各渠道退款率", formatter="percent")
 
-    qianchuan_df = op_df[op_df["platform"] == "千川"].copy()
-    st.markdown("### 千川投放补充分析")
+    st.markdown('<div class="section-title">千川投放补充分析</div>', unsafe_allow_html=True)
     st.caption("千川只作为投放补充分析，不与抖店 GMV 合并计算。")
+    qianchuan_df = filtered[filtered["platform"] == "千川"].copy()
     if qianchuan_df.empty:
-        st.info("暂无千川数据")
+        render_info_box("暂无千川数据")
     else:
-        render_line_chart(qianchuan_df, "gmv", "千川成交趋势")
-        render_line_chart(qianchuan_df, "net_gmv", "千川净成交趋势")
-        render_line_chart(qianchuan_df, "ad_spend", "千川消耗趋势")
-        render_line_chart(qianchuan_df, "roi", "千川 ROI 趋势")
-        render_line_chart(qianchuan_df, "net_roi", "千川净 ROI 趋势")
+        render_chart(qianchuan_df, "gmv", "千川成交趋势")
+        render_chart(qianchuan_df, "net_gmv", "千川净成交趋势")
+        render_chart(qianchuan_df, "ad_spend", "千川消耗趋势")
+        render_chart(qianchuan_df, "roi", "千川 ROI 趋势")
+        render_chart(qianchuan_df, "net_roi", "千川净 ROI 趋势")
+
+
+def severity_class(severity: str) -> tuple[str, str]:
+    if severity == "高":
+        return "alert-high", "tag-high"
+    if severity == "中":
+        return "alert-mid", "tag-mid"
+    return "alert-low", "tag-low"
+
+
+def render_alert_cards(alerts: pd.DataFrame, compact: bool = False):
+    if alerts.empty:
+        render_info_box("当前筛选范围内暂无明显异常。")
+        return
+    for _, row in alerts.iterrows():
+        box_class, tag_class = severity_class(str(row.get("严重程度", "低")))
+        details = "" if compact else f"<div><b>可能原因：</b>{row.get('可能原因', '')}</div><div><b>建议动作：</b>{row.get('建议动作', '')}</div>"
+        st.markdown(
+            f"""
+            <div class="alert-card {box_class}">
+                <div><b>{row.get('标题', '')}</b><span class="tag {tag_class}">{row.get('严重程度', '')}</span></div>
+                <div style="margin-top:8px;"><b>数据依据：</b>{row.get('数据依据', '')}</div>
+                {details}
+                <div style="margin-top:8px;color:#6b7280;font-size:13px;">
+                    {row.get('brand', '')} / {row.get('platform', '')} / {row.get('channel', '')} / {row.get('date', '')}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def render_alerts(op_df: pd.DataFrame):
     st.subheader("自动复盘提醒")
-    alerts = generate_alerts(op_df)
+    if op_df.empty:
+        render_info_box("暂无历史数据，请管理员在后台导入数据。")
+        return
+    min_date = op_df["date"].min().date()
+    max_date = op_df["date"].max().date()
+    date_range = st.date_input("日期范围", value=(min_date, max_date), min_value=min_date, max_value=max_date, key="alert_date_range")
+    filtered = filter_df(op_df, "全部", "全部", "全部", date_range)
+    alerts = generate_alerts(filtered)
     if alerts.empty:
-        st.success("当前没有触发规则提醒。")
+        render_info_box("当前筛选范围内暂无明显异常。")
         return
     severity_order = {"高": 0, "中": 1, "低": 2}
     alerts["排序"] = alerts["严重程度"].map(severity_order).fillna(9)
     alerts = alerts.sort_values(["排序", "date"], ascending=[True, False]).drop(columns=["排序"])
-    st.dataframe(
-        alerts[
-            [
-                "date",
-                "brand",
-                "platform",
-                "channel",
-                "标题",
-                "严重程度",
-                "数据依据",
-                "可能原因",
-                "建议动作",
-            ]
-        ],
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-def render_data_preview(raw_df: pd.DataFrame, op_df: pd.DataFrame, warnings: list[str], missing: list[str]):
-    with st.expander("数据预览与解析提示", expanded=False):
-        if missing:
-            st.warning("以下预期文件暂未找到：" + "、".join(missing))
-        if warnings:
-            st.info("解析提示：")
-            for item in warnings[:30]:
-                st.write(f"- {item}")
-            if len(warnings) > 30:
-                st.write(f"- 还有 {len(warnings) - 30} 条提示未展示")
-        st.write(f"标准长表导出位置：`{OUTPUT_CSV}`")
-        st.markdown("#### 标准长表预览")
-        st.dataframe(raw_df.head(100), use_container_width=True, hide_index=True)
-        st.markdown("#### 经营指标表预览")
-        st.dataframe(op_df.head(100), use_container_width=True, hide_index=True)
-
-
-def render_database_setup() -> bool:
-    with st.expander("数据库连接", expanded=not bool(get_database_url())):
-        database_url = get_database_url()
-        if not database_url:
-            st.error("请配置数据库连接")
-            st.caption("在 Streamlit Cloud 的 Secrets 或部署环境变量中设置 DATABASE_URL。")
-            return False
-
-        st.success("已检测到 DATABASE_URL。")
-        if st.button("初始化数据库"):
-            try:
-                init_db()
-                st.success("数据库初始化完成，必要数据表已创建。")
-            except Exception as exc:
-                st.error(f"数据库初始化失败：{exc}")
-                return False
-        return True
-
-
-def render_upload_tab() -> tuple[pd.DataFrame, pd.DataFrame, list[str], list[str]]:
-    st.subheader("上传数据")
-    st.info("上传的 Excel 会被解析并写入数据库；原始 Excel 文件本身不会被永久保存。真实经营数据不要提交到 GitHub。")
-    uploader_name = st.text_input("上传人（可选）", value="", placeholder="例如：运营同事姓名")
-    uploaded_files = st.file_uploader(
-        "上传 Excel 复盘表",
-        type=["xlsx"],
-        accept_multiple_files=True,
-        help="支持一次上传多个 Excel，系统会按文件名识别最护、碧维、抖店、拼多多、千川。",
-    )
-    if not uploaded_files:
-        raw_df, op_df = empty_dataframes()
-        export_normalized_data(raw_df)
-        st.warning("请上传 Excel 复盘表。")
-        return raw_df, op_df, [], EXPECTED_FILES.copy()
-
-    unknown_files = [
-        file.name
-        for file in uploaded_files
-        if identify_brand(file.name) == "未知品牌" or identify_platform(file.name) == "未知平台"
-    ]
-    if unknown_files:
-        st.warning("以下文件名未能完整识别品牌或平台：" + "、".join(unknown_files))
-
-    with st.spinner("正在解析上传的 Excel..."):
-        raw_df, op_df, warnings, missing = load_uploaded_data(uploaded_files)
-    render_data_preview(raw_df, op_df, warnings, missing)
-
-    if op_df.empty:
-        st.warning("上传文件已读取，但没有解析出可入库的经营指标。")
-    elif st.button("确认导入数据库", type="primary"):
-        with st.spinner("正在写入数据库..."):
-            ok, result = save_upload_to_database(raw_df, op_df, warnings, uploaded_files, uploader_name.strip() or None)
-        if ok:
-            st.success(result["message"])
-            cols = st.columns(3)
-            cols[0].metric("新增数量", result["inserted"])
-            cols[1].metric("更新数量", result["updated"])
-            cols[2].metric("失败/提示数量", result["failed"])
-        else:
-            st.error(result["message"])
-    return raw_df, op_df, warnings, missing
+    render_alert_cards(alerts)
 
 
 def main():
     st.set_page_config(page_title="电商经营复盘看板", layout="wide")
-    st.title("电商经营复盘看板")
-    st.caption("最护和碧维是不同品类品牌，本看板展示各自经营状态，不做品牌输赢对比。")
-    st.caption("千川数据只作为投放补充分析，不默认计入总 GMV，避免和抖店重复。")
+    inject_custom_css()
+    st.markdown('<div class="main-title">电商经营复盘看板</div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="subtle-note">最护和碧维是不同品类品牌，本看板展示各自经营状态，不做品牌输赢对比。<br>千川数据只作为投放补充分析，不默认计入总 GMV，避免和抖店重复。</div>',
+        unsafe_allow_html=True,
+    )
 
     if not require_password():
         return
 
-    render_database_setup()
+    if st.button("刷新数据"):
+        st.rerun()
 
-    tab_home, tab_trend, tab_upload, tab_channel, tab_alert = st.tabs(["老板首页", "历史趋势", "上传数据", "渠道分析", "自动复盘提醒"])
+    display_df, _history_message = load_history_from_database()
 
-    with tab_upload:
-        raw_df, op_df, warnings, missing = render_upload_tab()
-
-    history_df, history_message = load_history_from_database()
-    if history_message:
-        st.caption(history_message)
-
-    display_df = history_df
+    tab_home, tab_trend, tab_channel, tab_alert = st.tabs(["BOSS首页", "历史趋势", "渠道分析", "自动复盘提醒"])
 
     if display_df.empty:
         with tab_home:
-            st.warning("暂无历史数据。请到“上传数据”Tab 上传 Excel，并点击“确认导入数据库”。")
+            render_info_box("暂无历史数据，请管理员在后台导入数据。")
         with tab_trend:
-            st.info("数据库中暂无可展示的历史趋势。")
+            render_info_box("暂无历史数据，请管理员在后台导入数据。")
         with tab_channel:
-            st.info("数据库中暂无渠道数据。")
+            render_info_box("暂无历史数据，请管理员在后台导入数据。")
         with tab_alert:
-            st.info("数据库中暂无可生成提醒的数据。")
+            render_info_box("暂无历史数据，请管理员在后台导入数据。")
         return
 
     with tab_home:
